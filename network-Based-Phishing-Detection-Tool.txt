@@ -1,0 +1,114 @@
+from scapy.all import sniff, DNS, DNSQR, IP
+import re
+import math
+import logging
+from datetime import datetime
+from collections import Counter
+
+# ── Logging setup ──────────────────────────────────────────────
+logging.basicConfig(
+    filename="phishing_alerts.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(message)s"
+)
+
+# ── Detection rules ────────────────────────────────────────────
+SUSPICIOUS_KEYWORDS = [
+    "login", "secure", "verify", "account",
+    "update", "bank", "paypal", "free",
+    "signin", "password", "credential", "confirm"
+]
+
+SUSPICIOUS_TLDS = {".xyz", ".top", ".tk", ".ga", ".ml", ".gq", ".cf"}
+
+TRUSTED_DOMAINS = {"google.com", "microsoft.com", "github.com", "youtube.com"}
+
+# ── Helper: Shannon Entropy ────────────────────────────────────
+def shannon_entropy(domain):
+    """High entropy = random-looking = suspicious (e.g. xkqzpwl.tk)"""
+    probabilities = [
+        domain.count(c) / len(domain) for c in set(domain)
+    ]
+    return -sum(p * math.log2(p) for p in probabilities if p > 0)
+
+# ── Helper: Keyword match with word boundaries ─────────────────
+def keyword_match(domain):
+    for word in SUSPICIOUS_KEYWORDS:
+        # Avoids false positives like "riverbank" matching "bank"
+        if re.search(rf'\b{word}\b', domain):
+            return True
+    return False
+
+# ── Core detection logic ───────────────────────────────────────
+def get_root_domain(domain):
+    """Extract root domain (e.g. 'evil.free.xyz' → 'free.xyz')"""
+    parts = domain.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else domain
+
+def is_suspicious(domain):
+    root = get_root_domain(domain)
+
+    # Skip trusted domains
+    if root in TRUSTED_DOMAINS:
+        return False, []
+
+    reasons = []
+
+    if keyword_match(domain):
+        reasons.append("suspicious keyword")
+
+    if any(domain.endswith(tld) for tld in SUSPICIOUS_TLDS):
+        reasons.append("suspicious TLD")
+
+    if len(domain) > 35:
+        reasons.append(f"long domain ({len(domain)} chars)")
+
+    entropy = shannon_entropy(domain)
+    if entropy > 3.8:
+        reasons.append(f"high entropy ({entropy:.2f}) — looks random")
+
+    # Excessive hyphens (common in phishing: secure-login-verify.com)
+    if domain.count("-") >= 3:
+        reasons.append("excessive hyphens")
+
+    return bool(reasons), reasons
+
+# ── Packet handler ─────────────────────────────────────────────
+def process_packet(packet):
+    try:
+        if not (packet.haslayer(DNS) and packet[DNS].qr == 0):
+            return
+
+        domain = packet[DNSQR].qname.decode(errors="ignore").rstrip(".")
+        if not domain:
+            return
+
+        # Capture source IP if available
+        src_ip = packet[IP].src if packet.haslayer(IP) else "Unknown"
+        timestamp = datetime.now().strftime("%H:%M:%S")
+
+        suspicious, reasons = is_suspicious(domain.lower())
+
+        if suspicious:
+            alert = (
+                f"\n{'='*50}\n"
+                f"🚨 PHISHING ALERT  [{timestamp}]\n"
+                f"   Domain  : {domain}\n"
+                f"   Source  : {src_ip}\n"
+                f"   Reasons : {', '.join(reasons)}\n"
+                f"{'='*50}"
+            )
+            print(alert)
+            logging.info(f"ALERT | {src_ip} | {domain} | {', '.join(reasons)}")
+        else:
+            print(f"[{timestamp}] ✅ Safe: {domain} (from {src_ip})")
+
+    except Exception as e:
+        logging.error(f"Packet processing error: {e}")
+
+# ── Entry point ────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("🕵️  Network-Based Phishing Detection Started")
+    print(f"   Alerts logged to: phishing_alerts.log")
+    print("   Press CTRL+C to stop\n")
+    sniff(filter="udp port 53", prn=process_packet, store=0)
